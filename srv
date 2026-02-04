@@ -1,0 +1,774 @@
+#!/bin/bash
+set -euo pipefail
+
+# srv - minimal static site development server
+# https://<project>.localhost with htmx, partials, and optional cloudflare tunnels
+
+SRV_CONFIG_DIR="${HOME}/.config/srv"
+SRV_PROJECTS_FILE="${SRV_CONFIG_DIR}/projects.json"
+SRV_CADDYFILE="${SRV_CONFIG_DIR}/Caddyfile"
+SRV_TEMPLATE_DIR="${SRV_CONFIG_DIR}/template"
+SRV_PLIST="${HOME}/Library/LaunchAgents/land.charm.srv.proxy.plist"
+CODE_DIR="${HOME}/Code"
+BASE_PORT=3000
+
+# Colors for gum-less fallback
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Check if gum is available
+has_gum() {
+    command -v gum &>/dev/null
+}
+
+# Styled output
+log_info() {
+    if has_gum; then
+        gum style --foreground 4 "$1"
+    else
+        echo -e "${BLUE}$1${NC}"
+    fi
+}
+
+log_success() {
+    if has_gum; then
+        gum style --foreground 2 "✓ $1"
+    else
+        echo -e "${GREEN}✓ $1${NC}"
+    fi
+}
+
+log_error() {
+    if has_gum; then
+        gum style --foreground 1 "✗ $1"
+    else
+        echo -e "${RED}✗ $1${NC}" >&2
+    fi
+}
+
+log_warn() {
+    if has_gum; then
+        gum style --foreground 3 "$1"
+    else
+        echo -e "${YELLOW}$1${NC}"
+    fi
+}
+
+spin() {
+    local msg="$1"
+    shift
+    if has_gum; then
+        gum spin --spinner dot --title "$msg" -- "$@"
+    else
+        echo "$msg..."
+        "$@"
+    fi
+}
+
+confirm() {
+    local msg="$1"
+    if has_gum; then
+        gum confirm "$msg"
+    else
+        read -p "$msg [y/N] " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]]
+    fi
+}
+
+# Initialize config directory
+init_config() {
+    mkdir -p "$SRV_CONFIG_DIR"
+    mkdir -p "$SRV_TEMPLATE_DIR"
+    
+    if [[ ! -f "$SRV_PROJECTS_FILE" ]]; then
+        echo '{}' > "$SRV_PROJECTS_FILE"
+    fi
+}
+
+# Get next available port
+next_port() {
+    local max_port=$BASE_PORT
+    if [[ -f "$SRV_PROJECTS_FILE" ]]; then
+        local ports
+        ports=$(jq -r 'to_entries[].value.port // empty' "$SRV_PROJECTS_FILE" 2>/dev/null || echo "")
+        while read -r p; do
+            if [[ -n "$p" ]] && (( p >= max_port )); then
+                max_port=$((p + 1))
+            fi
+        done <<< "$ports"
+    fi
+    echo "$max_port"
+}
+
+# Get project info from current directory
+get_current_project() {
+    local dir
+    dir=$(pwd)
+    if [[ -f "$dir/.srv" ]]; then
+        basename "$dir"
+    else
+        echo ""
+    fi
+}
+
+get_project_port() {
+    local name="$1"
+    jq -r --arg n "$name" '.[$n].port // empty' "$SRV_PROJECTS_FILE"
+}
+
+get_project_path() {
+    local name="$1"
+    jq -r --arg n "$name" '.[$n].path // empty' "$SRV_PROJECTS_FILE"
+}
+
+# Register project
+register_project() {
+    local name="$1"
+    local port="$2"
+    local path="$3"
+    
+    local tmp
+    tmp=$(mktemp)
+    jq --arg n "$name" --argjson p "$port" --arg path "$path" \
+        '.[$n] = {"port": $p, "path": $path}' "$SRV_PROJECTS_FILE" > "$tmp"
+    mv "$tmp" "$SRV_PROJECTS_FILE"
+}
+
+# Unregister project
+unregister_project() {
+    local name="$1"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg n "$name" 'del(.[$n])' "$SRV_PROJECTS_FILE" > "$tmp"
+    mv "$tmp" "$SRV_PROJECTS_FILE"
+}
+
+# Generate Caddyfile
+generate_caddyfile() {
+    cat > "$SRV_CADDYFILE" << 'EOF'
+{
+    local_certs
+}
+
+EOF
+    
+    jq -r 'to_entries[] | "\(.key) \(.value.port)"' "$SRV_PROJECTS_FILE" 2>/dev/null | while read -r name port; do
+        if [[ -n "$name" ]] && [[ -n "$port" ]]; then
+            cat >> "$SRV_CADDYFILE" << EOF
+https://${name}.localhost {
+    reverse_proxy localhost:${port}
+}
+
+EOF
+        fi
+    done
+}
+
+# Reload central proxy
+reload_proxy() {
+    if launchctl list | grep -q "land.charm.srv.proxy"; then
+        caddy reload --config "$SRV_CADDYFILE" 2>/dev/null || true
+    fi
+}
+
+# Create launchd plist for proxy
+create_plist() {
+    local caddy_path
+    caddy_path=$(which caddy)
+    
+    cat > "$SRV_PLIST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>land.charm.srv.proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${caddy_path}</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>${SRV_CADDYFILE}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${SRV_CONFIG_DIR}/proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>${SRV_CONFIG_DIR}/proxy.err</string>
+</dict>
+</plist>
+EOF
+}
+
+# ============ COMMANDS ============
+
+cmd_install() {
+    log_info "Installing srv dependencies..."
+    
+    # Check/install gum
+    if ! command -v gum &>/dev/null; then
+        if confirm "gum not found. Install via Homebrew?"; then
+            spin "Installing gum" brew install gum
+            log_success "gum installed"
+        fi
+    else
+        log_success "gum already installed"
+    fi
+    
+    # Check/install jq
+    if ! command -v jq &>/dev/null; then
+        if confirm "jq not found. Install via Homebrew?"; then
+            spin "Installing jq" brew install jq
+            log_success "jq installed"
+        fi
+    else
+        log_success "jq already installed"
+    fi
+    
+    # Check/install caddy
+    if ! command -v caddy &>/dev/null; then
+        if confirm "Caddy not found. Install via Homebrew?"; then
+            spin "Installing Caddy" brew install caddy
+            log_success "Caddy installed"
+        fi
+    else
+        log_success "Caddy already installed"
+    fi
+    
+    # Initialize config
+    init_config
+    
+    # Create template
+    cmd_init_template
+    
+    # Generate initial Caddyfile
+    generate_caddyfile
+    
+    # Create and load launchd service
+    create_plist
+    
+    # Unload if already loaded
+    launchctl bootout gui/$(id -u) "$SRV_PLIST" 2>/dev/null || true
+    
+    # Load the service
+    launchctl bootstrap gui/$(id -u) "$SRV_PLIST"
+    log_success "Proxy service installed and started"
+    
+    # Trust Caddy CA (must happen after Caddy is running)
+    sleep 1  # Give Caddy time to start
+    if confirm "Trust Caddy's local CA for HTTPS? (requires sudo)"; then
+        sudo caddy trust
+        log_success "Caddy CA trusted"
+    fi
+    
+    # Cloudflare tunnel config
+    if command -v cloudflared &>/dev/null; then
+        log_success "cloudflared detected"
+        echo ""
+        log_info "For persistent tunnels, configure your domain:"
+        echo "  1. Create a tunnel: cloudflared tunnel create crm114"
+        echo "  2. Route DNS: cloudflared tunnel route dns crm114 crm114.alexcabrera.me"
+        echo "  3. Add to ~/.config/srv/config.json:"
+        echo '     {"tunnel_name": "crm114", "domain": "alexcabrera.me"}'
+    else
+        log_warn "cloudflared not found - tunnel feature unavailable"
+    fi
+    
+    echo ""
+    log_success "srv installed! Run 'srv new <project>' to create a site."
+}
+
+cmd_init_template() {
+    mkdir -p "$SRV_TEMPLATE_DIR"/{css,js,partials,lib}
+    
+    # index.html
+    cat > "$SRV_TEMPLATE_DIR/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>__PROJECT__</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <script src="/lib/htmx.min.js"></script>
+</head>
+<body>
+    <h1>__PROJECT__</h1>
+</body>
+</html>
+EOF
+
+    # style.css
+    cat > "$SRV_TEMPLATE_DIR/css/style.css" << 'EOF'
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+EOF
+
+    # main.js
+    cat > "$SRV_TEMPLATE_DIR/js/main.js" << 'EOF'
+EOF
+
+    # AGENTS.md
+    cat > "$SRV_TEMPLATE_DIR/AGENTS.md" << 'EOF'
+# Project Agent Instructions
+
+## Stack
+- HTML5 (semantic, minimal)
+- Modern vanilla CSS (no preprocessors)
+- Modern vanilla JS (ES modules, no bundler)
+- htmx for dynamic behavior
+- Static files only - no build step
+
+## Structure
+- `/index.html` - entry point
+- `/css/` - stylesheets
+- `/js/` - scripts (ES modules)
+- `/lib/` - vendored third-party libraries
+- `/partials/` - HTML fragments for htmx
+
+## Conventions
+- Keep files small and focused
+- Use htmx attributes for interactivity
+- Vendor all dependencies into `/lib/`
+- No external CDN links
+
+## Development
+- Start server: `srv start`
+- Open browser: `srv open`
+- Stop server: `srv stop`
+- Public tunnel: `srv tunnel`
+EOF
+
+    # Download htmx
+    if [[ ! -f "$SRV_TEMPLATE_DIR/lib/htmx.min.js" ]]; then
+        if command -v curl &>/dev/null 2>&1; then
+            curl -sL "https://unpkg.com/htmx.org@latest/dist/htmx.min.js" -o "$SRV_TEMPLATE_DIR/lib/htmx.min.js" 2>/dev/null || true
+        fi
+    fi
+    
+    # Fallback: embed htmx if download failed
+    if [[ ! -s "$SRV_TEMPLATE_DIR/lib/htmx.min.js" ]]; then
+        log_warn "Could not download htmx, using embedded version"
+        # The install script should handle this, or user can manually add
+    fi
+    
+    log_success "Template initialized"
+}
+
+cmd_new() {
+    local name="${1:-}"
+    
+    if [[ -z "$name" ]]; then
+        if has_gum; then
+            name=$(gum input --placeholder "project name")
+        else
+            read -p "Project name: " name
+        fi
+    fi
+    
+    if [[ -z "$name" ]]; then
+        log_error "Project name required"
+        exit 1
+    fi
+    
+    # Validate name (alphanumeric and hyphens only)
+    if [[ ! "$name" =~ ^[a-z0-9-]+$ ]]; then
+        log_error "Invalid name: use lowercase letters, numbers, and hyphens only"
+        exit 1
+    fi
+    
+    local project_dir="${CODE_DIR}/${name}"
+    
+    if [[ -d "$project_dir" ]]; then
+        log_error "Directory already exists: $project_dir"
+        exit 1
+    fi
+    
+    # Check if already registered
+    if [[ -n "$(get_project_port "$name")" ]]; then
+        log_error "Project '$name' already registered"
+        exit 1
+    fi
+    
+    init_config
+    
+    # Ensure template exists
+    if [[ ! -d "$SRV_TEMPLATE_DIR" ]]; then
+        cmd_init_template
+    fi
+    
+    # Create project from template
+    log_info "Creating $name..."
+    mkdir -p "$project_dir"
+    cp -R "$SRV_TEMPLATE_DIR"/* "$project_dir/"
+    
+    # Replace placeholders
+    if [[ "$(uname)" == "Darwin" ]]; then
+        find "$project_dir" -type f -exec sed -i '' "s/__PROJECT__/$name/g" {} \;
+    else
+        find "$project_dir" -type f -exec sed -i "s/__PROJECT__/$name/g" {} \;
+    fi
+    
+    # Assign port
+    local port
+    port=$(next_port)
+    echo "$port" > "$project_dir/.srv"
+    
+    # Register
+    register_project "$name" "$port" "$project_dir"
+    
+    # Regenerate Caddyfile
+    generate_caddyfile
+    reload_proxy
+    
+    log_success "Created $name at $project_dir"
+    log_info "URL: https://${name}.localhost"
+    
+    # Start the server
+    cd "$project_dir"
+    cmd_start
+    
+    # Open in browser
+    if confirm "Open in browser?"; then
+        cmd_open
+    fi
+}
+
+cmd_start() {
+    local name
+    name=$(get_current_project)
+    
+    if [[ -z "$name" ]]; then
+        log_error "Not in a srv project directory"
+        exit 1
+    fi
+    
+    local port
+    port=$(cat .srv)
+    
+    # Check if already running
+    if lsof -i ":$port" &>/dev/null; then
+        log_warn "Server already running on port $port"
+        return
+    fi
+    
+    log_info "Starting $name on port $port..."
+    
+    # Start caddy file-server in background
+    caddy file-server --listen ":$port" --root "$(pwd)" &>/dev/null &
+    local pid=$!
+    echo "$pid" > .srv.pid
+    
+    sleep 0.5
+    
+    if kill -0 "$pid" 2>/dev/null; then
+        log_success "Server running: https://${name}.localhost"
+    else
+        log_error "Failed to start server"
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    local name
+    name=$(get_current_project)
+    
+    if [[ -z "$name" ]]; then
+        log_error "Not in a srv project directory"
+        exit 1
+    fi
+    
+    if [[ -f .srv.pid ]]; then
+        local pid
+        pid=$(cat .srv.pid)
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            log_success "Stopped $name"
+        fi
+        rm -f .srv.pid
+    else
+        local port
+        port=$(cat .srv)
+        # Try to find and kill process on port
+        local pid
+        pid=$(lsof -ti ":$port" 2>/dev/null || true)
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+            log_success "Stopped $name"
+        else
+            log_warn "Server not running"
+        fi
+    fi
+}
+
+cmd_list() {
+    init_config
+    
+    if has_gum; then
+        gum style --bold "Projects"
+        echo ""
+    else
+        echo "Projects"
+        echo "--------"
+    fi
+    
+    jq -r 'to_entries[] | "\(.key)|\(.value.port)|\(.value.path)"' "$SRV_PROJECTS_FILE" 2>/dev/null | while IFS='|' read -r name port path; do
+        local status="stopped"
+        local status_color="1"  # red
+        
+        if lsof -i ":$port" &>/dev/null; then
+            status="running"
+            status_color="2"  # green
+        fi
+        
+        if has_gum; then
+            echo "  $(gum style --foreground "$status_color" "●") $name (https://${name}.localhost) - $status"
+        else
+            if [[ "$status" == "running" ]]; then
+                echo -e "  ${GREEN}●${NC} $name (https://${name}.localhost) - $status"
+            else
+                echo -e "  ${RED}●${NC} $name (https://${name}.localhost) - $status"
+            fi
+        fi
+    done
+    
+    if [[ ! -s "$SRV_PROJECTS_FILE" ]] || [[ "$(cat "$SRV_PROJECTS_FILE")" == "{}" ]]; then
+        log_info "No projects yet. Run 'srv new <name>' to create one."
+    fi
+}
+
+cmd_open() {
+    local name
+    name=$(get_current_project)
+    
+    if [[ -z "$name" ]]; then
+        log_error "Not in a srv project directory"
+        exit 1
+    fi
+    
+    open "https://${name}.localhost"
+}
+
+cmd_tunnel() {
+    local name
+    name=$(get_current_project)
+    
+    if [[ -z "$name" ]]; then
+        log_error "Not in a srv project directory"
+        exit 1
+    fi
+    
+    if ! command -v cloudflared &>/dev/null; then
+        log_error "cloudflared not installed"
+        exit 1
+    fi
+    
+    local persist="${1:-}"
+    local port
+    port=$(cat .srv)
+    
+    if [[ "$persist" == "--persist" ]]; then
+        # Check for config
+        local config_file="${SRV_CONFIG_DIR}/config.json"
+        if [[ ! -f "$config_file" ]]; then
+            log_error "No tunnel config found. Create ${config_file} with:"
+            echo '  {"tunnel_name": "crm114", "domain": "alexcabrera.me"}'
+            exit 1
+        fi
+        
+        local tunnel_name domain
+        tunnel_name=$(jq -r '.tunnel_name' "$config_file")
+        domain=$(jq -r '.domain' "$config_file")
+        
+        if [[ -z "$tunnel_name" ]] || [[ "$tunnel_name" == "null" ]]; then
+            log_error "tunnel_name not set in config"
+            exit 1
+        fi
+        
+        if [[ -z "$domain" ]] || [[ "$domain" == "null" ]]; then
+            log_error "domain not set in config"
+            exit 1
+        fi
+        
+        local subdomain="${name}.${tunnel_name}.${domain}"
+        
+        log_info "Creating persistent tunnel: $subdomain"
+        
+        # Check if tunnel exists
+        if ! cloudflared tunnel info "$tunnel_name" &>/dev/null; then
+            log_info "Creating tunnel '$tunnel_name'..."
+            cloudflared tunnel create "$tunnel_name"
+        fi
+        
+        # Route DNS
+        log_info "Routing DNS..."
+        cloudflared tunnel route dns "$tunnel_name" "$subdomain" 2>/dev/null || true
+        
+        # Create ingress config
+        local tunnel_config="${SRV_CONFIG_DIR}/tunnel-${name}.yml"
+        cat > "$tunnel_config" << EOF
+tunnel: ${tunnel_name}
+credentials-file: ${HOME}/.cloudflared/${tunnel_name}.json
+
+ingress:
+  - hostname: ${subdomain}
+    service: https://localhost:${port}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+        
+        log_success "Tunnel configured: https://${subdomain}"
+        log_info "Run: cloudflared tunnel --config ${tunnel_config} run ${tunnel_name}"
+        
+    else
+        # Quick tunnel
+        log_info "Starting quick tunnel for $name..."
+        cloudflared tunnel --url "https://localhost:${port}"
+    fi
+}
+
+cmd_proxy() {
+    local action="${1:-status}"
+    
+    case "$action" in
+        start)
+            if launchctl list | grep -q "land.charm.srv.proxy"; then
+                log_warn "Proxy already running"
+            else
+                launchctl bootstrap gui/$(id -u) "$SRV_PLIST"
+                log_success "Proxy started"
+            fi
+            ;;
+        stop)
+            launchctl bootout gui/$(id -u) "$SRV_PLIST" 2>/dev/null || true
+            log_success "Proxy stopped"
+            ;;
+        restart)
+            launchctl bootout gui/$(id -u) "$SRV_PLIST" 2>/dev/null || true
+            sleep 1
+            launchctl bootstrap gui/$(id -u) "$SRV_PLIST"
+            log_success "Proxy restarted"
+            ;;
+        status)
+            if launchctl list | grep -q "land.charm.srv.proxy"; then
+                log_success "Proxy running"
+            else
+                log_warn "Proxy not running"
+            fi
+            ;;
+        *)
+            log_error "Unknown action: $action (use start|stop|restart|status)"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    
+    if [[ -z "$name" ]]; then
+        name=$(get_current_project)
+    fi
+    
+    if [[ -z "$name" ]]; then
+        log_error "Project name required or run from project directory"
+        exit 1
+    fi
+    
+    local path
+    path=$(get_project_path "$name")
+    
+    if [[ -z "$path" ]]; then
+        log_error "Project '$name' not found"
+        exit 1
+    fi
+    
+    if confirm "Remove project '$name' from registry? (files will NOT be deleted)"; then
+        # Stop if running
+        if [[ -d "$path" ]] && [[ -f "$path/.srv" ]]; then
+            local port
+            port=$(cat "$path/.srv")
+            local pid
+            pid=$(lsof -ti ":$port" 2>/dev/null || true)
+            if [[ -n "$pid" ]]; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        fi
+        
+        unregister_project "$name"
+        generate_caddyfile
+        reload_proxy
+        
+        log_success "Removed $name from registry"
+        log_info "Files remain at: $path"
+    fi
+}
+
+cmd_help() {
+    if has_gum; then
+        gum style --bold "srv - static site dev server"
+        echo ""
+    else
+        echo "srv - static site dev server"
+        echo ""
+    fi
+    
+    cat << 'EOF'
+Usage: srv <command> [args]
+
+Commands:
+  install           Install dependencies (caddy, gum, jq) and configure
+  new <name>        Create new project from template
+  start             Start server for current project
+  stop              Stop server for current project
+  list              Show all registered projects
+  open              Open current project in browser
+  tunnel [--persist] Expose via cloudflare tunnel
+  proxy <action>    Manage central proxy (start|stop|restart|status)
+  remove [name]     Remove project from registry
+  help              Show this help
+
+Examples:
+  srv install       # First-time setup
+  srv new mysite    # Create new project
+  cd ~/Code/mysite && srv start
+  srv tunnel        # Quick public URL
+  srv tunnel --persist  # Persistent subdomain
+EOF
+}
+
+# ============ MAIN ============
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    
+    case "$cmd" in
+        install)    cmd_install "$@" ;;
+        new)        cmd_new "$@" ;;
+        start)      cmd_start "$@" ;;
+        stop)       cmd_stop "$@" ;;
+        list|ls)    cmd_list "$@" ;;
+        open)       cmd_open "$@" ;;
+        tunnel)     cmd_tunnel "$@" ;;
+        proxy)      cmd_proxy "$@" ;;
+        remove|rm)  cmd_remove "$@" ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            log_error "Unknown command: $cmd"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
