@@ -9,7 +9,6 @@ SRV_PROJECTS_FILE="${SRV_CONFIG_DIR}/projects.json"
 SRV_CADDYFILE="${SRV_CONFIG_DIR}/Caddyfile"
 SRV_TEMPLATE_DIR="${SRV_CONFIG_DIR}/template"
 SRV_PLIST="${HOME}/Library/LaunchAgents/land.charm.srv.proxy.plist"
-CODE_DIR="${HOME}/Code"
 BASE_PORT=3000
 
 # Colors for gum-less fallback
@@ -109,7 +108,31 @@ get_current_project() {
     local dir
     dir=$(pwd)
     if [[ -f "$dir/.srv" ]]; then
-        basename "$dir"
+        # Extract project name from .srv file or use directory basename
+        local name
+        name=$(jq -r '.name // empty' "$dir/.srv" 2>/dev/null || true)
+        if [[ -z "$name" ]]; then
+            # Legacy: .srv is just a port number, derive name from path
+            name=$(basename "$dir")
+        fi
+        echo "$name"
+    else
+        echo ""
+    fi
+}
+
+get_current_port() {
+    local dir
+    dir=$(pwd)
+    if [[ -f "$dir/.srv" ]]; then
+        # Try JSON format first
+        local port
+        port=$(jq -r '.port // empty' "$dir/.srv" 2>/dev/null || true)
+        if [[ -z "$port" ]]; then
+            # Legacy: .srv is just a port number
+            port=$(cat "$dir/.srv")
+        fi
+        echo "$port"
     else
         echo ""
     fi
@@ -365,12 +388,15 @@ EOF
 
 cmd_new() {
     local name="${1:-}"
+    local project_dir
+    project_dir=$(pwd)
     
     if [[ -z "$name" ]]; then
         if has_gum; then
-            name=$(gum input --placeholder "project name")
+            name=$(gum input --placeholder "project name" --value "$(basename "$project_dir")")
         else
-            read -p "Project name: " name
+            read -p "Project name [$(basename "$project_dir")]: " name
+            name="${name:-$(basename "$project_dir")}"
         fi
     fi
     
@@ -385,10 +411,9 @@ cmd_new() {
         exit 1
     fi
     
-    local project_dir="${CODE_DIR}/${name}"
-    
-    if [[ -d "$project_dir" ]]; then
-        log_error "Directory already exists: $project_dir"
+    # Check if directory already has .srv
+    if [[ -f "$project_dir/.srv" ]]; then
+        log_error "Directory already initialized. Use 'srv register' to re-register."
         exit 1
     fi
     
@@ -405,22 +430,25 @@ cmd_new() {
         cmd_init_template
     fi
     
-    # Create project from template
-    log_info "Creating $name..."
-    mkdir -p "$project_dir"
-    cp -R "$SRV_TEMPLATE_DIR"/* "$project_dir/"
+    # Create project from template in current directory
+    log_info "Initializing $name in $project_dir..."
+    cp -Rn "$SRV_TEMPLATE_DIR"/* "$project_dir/" 2>/dev/null || true
     
     # Replace placeholders
     if [[ "$(uname)" == "Darwin" ]]; then
-        find "$project_dir" -type f -exec sed -i '' "s/__PROJECT__/$name/g" {} \;
+        find "$project_dir" -type f -name "*.html" -exec sed -i '' "s/__PROJECT__/$name/g" {} \;
+        find "$project_dir" -type f -name "*.md" -exec sed -i '' "s/__PROJECT__/$name/g" {} \;
     else
-        find "$project_dir" -type f -exec sed -i "s/__PROJECT__/$name/g" {} \;
+        find "$project_dir" -type f -name "*.html" -exec sed -i "s/__PROJECT__/$name/g" {} \;
+        find "$project_dir" -type f -name "*.md" -exec sed -i "s/__PROJECT__/$name/g" {} \;
     fi
     
-    # Assign port
+    # Assign port and write .srv file (JSON format)
     local port
     port=$(next_port)
-    echo "$port" > "$project_dir/.srv"
+    cat > "$project_dir/.srv" << EOF
+{"name": "$name", "port": $port}
+EOF
     
     # Register
     register_project "$name" "$port" "$project_dir"
@@ -433,7 +461,6 @@ cmd_new() {
     log_info "URL: https://${name}.localhost"
     
     # Start the server
-    cd "$project_dir"
     cmd_start
     
     # Open in browser
@@ -452,7 +479,7 @@ cmd_start() {
     fi
     
     local port
-    port=$(cat .srv)
+    port=$(get_current_port)
     
     # Check if already running
     if lsof -i ":$port" &>/dev/null; then
@@ -496,7 +523,7 @@ cmd_stop() {
         rm -f .srv.pid
     else
         local port
-        port=$(cat .srv)
+        port=$(get_current_port)
         # Try to find and kill process on port
         local pid
         pid=$(lsof -ti ":$port" 2>/dev/null || true)
@@ -575,6 +602,9 @@ cmd_tunnel() {
     local port
     port=$(cat .srv)
     
+    local port
+    port=$(get_current_port)
+    
     if [[ "$persist" == "--persist" ]]; then
         # Check for config
         local config_file="${SRV_CONFIG_DIR}/config.json"
@@ -634,6 +664,125 @@ EOF
         log_info "Starting quick tunnel for $name..."
         cloudflared tunnel --url "https://localhost:${port}"
     fi
+}
+
+cmd_register() {
+    local name="${1:-}"
+    local project_dir
+    project_dir=$(pwd)
+    
+    # If .srv exists, read existing name as default
+    local existing_name=""
+    if [[ -f "$project_dir/.srv" ]]; then
+        existing_name=$(jq -r '.name // empty' "$project_dir/.srv" 2>/dev/null || true)
+        if [[ -z "$existing_name" ]]; then
+            existing_name=$(basename "$project_dir")
+        fi
+    fi
+    
+    if [[ -z "$name" ]]; then
+        local default_name="${existing_name:-$(basename "$project_dir")}"
+        if has_gum; then
+            name=$(gum input --placeholder "project name" --value "$default_name")
+        else
+            read -p "Project name [$default_name]: " name
+            name="${name:-$default_name}"
+        fi
+    fi
+    
+    if [[ -z "$name" ]]; then
+        log_error "Project name required"
+        exit 1
+    fi
+    
+    # Validate name
+    if [[ ! "$name" =~ ^[a-z0-9-]+$ ]]; then
+        log_error "Invalid name: use lowercase letters, numbers, and hyphens only"
+        exit 1
+    fi
+    
+    init_config
+    
+    # Check if name is taken by different path
+    local existing_path
+    existing_path=$(get_project_path "$name")
+    if [[ -n "$existing_path" ]] && [[ "$existing_path" != "$project_dir" ]]; then
+        log_error "Name '$name' already registered to $existing_path"
+        exit 1
+    fi
+    
+    # Assign port (reuse existing if present)
+    local port
+    if [[ -f "$project_dir/.srv" ]]; then
+        port=$(jq -r '.port // empty' "$project_dir/.srv" 2>/dev/null || true)
+        if [[ -z "$port" ]]; then
+            port=$(cat "$project_dir/.srv" 2>/dev/null | grep -E '^[0-9]+$' || true)
+        fi
+    fi
+    if [[ -z "$port" ]]; then
+        port=$(next_port)
+    fi
+    
+    # Write .srv file (JSON format)
+    cat > "$project_dir/.srv" << EOF
+{"name": "$name", "port": $port}
+EOF
+    
+    # Register
+    register_project "$name" "$port" "$project_dir"
+    
+    # Regenerate Caddyfile
+    generate_caddyfile
+    reload_proxy
+    
+    log_success "Registered $name at $project_dir"
+    log_info "URL: https://${name}.localhost"
+}
+
+cmd_sync() {
+    log_info "Scanning for .srv files..."
+    
+    init_config
+    
+    # Clear existing projects
+    echo '{}' > "$SRV_PROJECTS_FILE"
+    
+    local count=0
+    
+    # Find all .srv files and register them
+    while IFS= read -r srv_file; do
+        local project_dir
+        project_dir=$(dirname "$srv_file")
+        
+        local name port
+        # Try JSON format
+        name=$(jq -r '.name // empty' "$srv_file" 2>/dev/null || true)
+        port=$(jq -r '.port // empty' "$srv_file" 2>/dev/null || true)
+        
+        # Fallback: legacy format (just port number)
+        if [[ -z "$name" ]]; then
+            name=$(basename "$project_dir")
+        fi
+        if [[ -z "$port" ]]; then
+            port=$(cat "$srv_file" 2>/dev/null | grep -E '^[0-9]+$' || true)
+        fi
+        
+        if [[ -n "$name" ]] && [[ -n "$port" ]]; then
+            # Update .srv to JSON format
+            cat > "$srv_file" << EOF
+{"name": "$name", "port": $port}
+EOF
+            register_project "$name" "$port" "$project_dir"
+            log_success "Found: $name ($project_dir)"
+            ((count++))
+        fi
+    done < <(find "$HOME" -name ".srv" -type f 2>/dev/null | grep -v "/.config/" | head -100)
+    
+    # Regenerate Caddyfile
+    generate_caddyfile
+    reload_proxy
+    
+    log_success "Synced $count projects"
 }
 
 cmd_proxy() {
@@ -727,7 +876,9 @@ Usage: srv <command> [args]
 
 Commands:
   install           Install dependencies (caddy, gum, jq) and configure
-  new <name>        Create new project from template
+  new [name]        Initialize current directory as project (with template)
+  register [name]   Register current directory (no template files)
+  sync              Rebuild config by scanning for .srv files
   start             Start server for current project
   stop              Stop server for current project
   list              Show all registered projects
@@ -739,10 +890,10 @@ Commands:
 
 Examples:
   srv install       # First-time setup
-  srv new mysite    # Create new project
-  cd ~/Code/mysite && srv start
+  mkdir mysite && cd mysite && srv new  # Create project in cwd
+  cd ~/Code/existing && srv register    # Register existing directory
+  srv sync          # Rebuild configs from .srv files
   srv tunnel        # Quick public URL
-  srv tunnel --persist  # Persistent subdomain
 EOF
 }
 
@@ -762,6 +913,8 @@ main() {
         tunnel)     cmd_tunnel "$@" ;;
         proxy)      cmd_proxy "$@" ;;
         remove|rm)  cmd_remove "$@" ;;
+        register)   cmd_register "$@" ;;
+        sync)       cmd_sync "$@" ;;
         help|--help|-h) cmd_help ;;
         *)
             log_error "Unknown command: $cmd"
